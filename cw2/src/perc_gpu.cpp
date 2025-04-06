@@ -161,11 +161,8 @@ struct GpuRunner::Impl {
       }
     }
 
-    // Update only the boundary regions from device to host
-    #pragma omp target update from(data[1*stride + p.sub_ny:p.sub_nx]) // top boundary
-    #pragma omp target update from(data[p.sub_nx*stride + 1:p.sub_ny]) // right boundary
-    #pragma omp target update from(data[1*stride + 1:p.sub_nx]) // bottom boundary
-    #pragma omp target update from(data[1*stride + 1:p.sub_ny]) // left boundary
+    // Update the entire data array from device to host instead of using complex section syntax
+    #pragma omp target update from(data[0:local_size()])
 
     // Pack boundary data into separate buffers
     if (neigh_ranks[0] != -1) { // top
@@ -228,11 +225,8 @@ struct GpuRunner::Impl {
       }
     }
 
-    // Update only the halo regions on device
-    #pragma omp target update to(data[1*stride + p.sub_ny + 1:p.sub_nx]) // top halo
-    #pragma omp target update to(data[(p.sub_nx + 1)*stride + 1:p.sub_ny]) // right halo
-    #pragma omp target update to(data[1*stride + 0:p.sub_nx]) // bottom halo
-    #pragma omp target update to(data[0*stride + 1:p.sub_ny]) // left halo
+    // Update the entire data array on device instead of using complex section syntax
+    #pragma omp target update to(data[0:local_size()])
 
     // Wait for sends to complete
     for (int b = 4; b < 8; ++b) {
