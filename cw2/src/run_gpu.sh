@@ -7,28 +7,18 @@
 #SBATCH --partition=gpu
 #SBATCH --account=<your_cirrus_budget_code>
 
-# Print info about the job
+# Print basic job information
 echo "Running on nodes: $SLURM_NODELIST"
 echo "Running on $SLURM_NNODES nodes with $SLURM_NTASKS total tasks"
 echo "GPUs per node: $SLURM_GPUS_PER_NODE"
 
-# Load required modules
-module load gcc/10.2.0 
-module load nvidia/nvhpc-nompi/24.5 
-module load openmpi/4.1.6-cuda-12.4
-
-# Set critical environment variables for GPU visibility
-export NVCOMPILER_ACC_GPU_TARGET=cc70
-export NVCOMPILER_CUDA_HOME=/opt/nvidia/hpc_sdk/Linux_x86_64/24.5/cuda
-export CUDA_HOME=/opt/nvidia/hpc_sdk/Linux_x86_64/24.5/cuda
-export PATH=$CUDA_HOME/bin:$PATH
-export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+# Load required modules exactly as specified in the instructions
+module load cmake gcc/10.2.0 nvidia/nvhpc-nompi/24.5 openmpi/4.1.6-cuda-12.4
 
 # Display GPU information
 nvidia-smi
 
-# Run the executable with SLURM - this ensures proper GPU binding
+# Run the executable with SLURM
 srun -n 8 --gpus-per-node=4 ./build/test
 
 # Alternative run using MPI directly (sometimes better for GPU binding)
