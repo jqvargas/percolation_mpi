@@ -15,9 +15,9 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <omp.h>
 
 #include "decomp.h"
-#include <omp.h>
 
 constexpr int printfreq = 100;
 
@@ -31,30 +31,30 @@ static int percolate_gpu_step(int M, int N, int const* state, int* next) {
   int nchange = 0;
   int const stride = N + 2;
 
-  // Simple GPU offloading for single device
+  // Enhanced GPU kernel
   #pragma omp target teams distribute parallel for collapse(2) \
-    map(tofrom: nchange) map(to: state[0:(M+2)*(N+2)]) map(from: next[0:(M+2)*(N+2)]) \
-    reduction(+:nchange)
+    map(tofrom: nchange) reduction(+:nchange)
   for (int i = 1; i <= M; ++i) {
     for (int j = 1; j <= N; ++j) {
-      int const oldval = state[i*stride + j];
+      int const idx = i*stride + j;
+      int const oldval = state[idx];
       int newval = oldval;
 
       // 0 => solid, so do nothing
       if (oldval != 0) {
-	// Set next[i][j] to be the maximum value of state[i][j] and
-	// its four nearest neighbours
-	newval = std::max(newval, state[(i-1)*stride + j  ]);
-	newval = std::max(newval, state[(i+1)*stride + j  ]);
-	newval = std::max(newval, state[    i*stride + j-1]);
-	newval = std::max(newval, state[    i*stride + j+1]);
+        // Set next[i][j] to be the maximum value of state[i][j] and
+        // its four nearest neighbours
+        newval = std::max(newval, state[idx - stride]); // North
+        newval = std::max(newval, state[idx + stride]); // South
+        newval = std::max(newval, state[idx - 1]);      // West
+        newval = std::max(newval, state[idx + 1]);      // East
 
-	if (newval != oldval) {
-	  ++nchange;
-	}
+        if (newval != oldval) {
+          ++nchange;
+        }
       }
 
-      next[i*stride + j] = newval;
+      next[idx] = newval;
     }
   }
   return nchange;
@@ -69,8 +69,10 @@ struct GpuRunner::Impl {
 
   // Device management
   int device_id; // Assigned GPU device ID
+  int node_id;   // Node ID
+  char hostname[MPI_MAX_PROCESSOR_NAME]; // Hostname for better debugging
 
-  // Current implementation uses raw pointers for simplicity
+  // Use managed memory for efficient host-device transfers
   int* state;
   int* tmp;
 
@@ -83,29 +85,47 @@ struct GpuRunner::Impl {
   std::vector<int> halo_send_buf;
   std::vector<int> halo_recv_buf;
 
+  // MPI request arrays for non-blocking communication
+  std::array<MPI_Request, 8> requests;  // 4 sends + 4 receives
+
   Impl(ParallelDecomp const& pd) : p(pd) {
+    // Get hostname for better debugging
+    int namelen;
+    MPI_Get_processor_name(hostname, &namelen);
+    
     // Set up device assignment using MPI_Comm_split_type
     MPI_Comm node_comm;
     int node_rank;
     
+    // Split communicator by node
     MPI_Comm_split_type(p.comm, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node_comm);
     MPI_Comm_rank(node_comm, &node_rank);
     
-    // Get number of devices - simplified approach
-    int num_devices = 1;  // Fallback value
+    // Get node ID (this requires all processes on a node to have consecutive ranks)
+    int node_size;
+    MPI_Comm_size(node_comm, &node_size);
+    node_id = p.rank / node_size;
+    
+    // Get number of devices on this node
+    int num_devices = 0;
     #pragma omp parallel
     {
-      #pragma omp master
+      #pragma omp single
       {
         num_devices = omp_get_num_devices();
       }
     }
     
-    // Assign device (round-robin)
-    device_id = node_rank % num_devices;
+    // Assign device (round-robin within each node)
+    if (num_devices > 0) {
+      device_id = node_rank % num_devices;
+    } else {
+      device_id = 0; // Fallback to device 0 if no devices found
+    }
     
-    // Let's print the assignment for debugging
-    printf("Rank %d on node assigned to GPU device %d\n", p.rank, device_id);
+    // Print assignment for debugging
+    printf("Rank %d on node %d (hostname: %s) assigned to GPU device %d of %d available devices\n", 
+           p.rank, node_id, hostname, device_id, num_devices);
     
     // Set default device
     omp_set_default_device(device_id);
@@ -113,10 +133,10 @@ struct GpuRunner::Impl {
     // Free the communicator
     MPI_Comm_free(&node_comm);
 
-    // Allocate memory
+    // Allocate memory - using persistent target data constructs
     state = new int[local_size()];
     tmp = new int[local_size()];
-
+    
     // Initialize device memory
     #pragma omp target enter data map(alloc: state[0:local_size()], tmp[0:local_size()])
 
@@ -138,6 +158,11 @@ struct GpuRunner::Impl {
     auto halo_buf_size = 2 * (p.sub_nx + p.sub_ny);
     halo_send_buf.resize(halo_buf_size);
     halo_recv_buf.resize(halo_buf_size);
+
+    // Initialize requests array
+    for (auto& req : requests) {
+      req = MPI_REQUEST_NULL;
+    }
   }
     
   ~Impl() {
@@ -152,28 +177,14 @@ struct GpuRunner::Impl {
   }
 
   // Communicate the valid edge sites to neighbours that exist. Fill
-  // halos on the receiving side.
+  // halos on the receiving side using non-blocking communication
   void halo_exchange(int* data) {
-    // Simple halo exchange for single device
-    std::array<MPI_Request, 4> reqs;
-
     auto const stride = p.sub_ny + 2;
-
-    // Post recvs
-    for (int b = 0, offset = 0; b < 4; ++b) {
-      if (neigh_ranks[b] == -1) {
-	reqs[b] = MPI_REQUEST_NULL;
-      } else {
-	MPI_Irecv(halo_recv_buf.data() + offset, neigh_counts[b], MPI_INT,
-		  neigh_ranks[b], 0, p.comm, &reqs[b]);
-      }
-      offset += neigh_counts[b];
-    }
-
-    // Copy halo data from device to host
+    
+    // Copy boundary data from device to host for sending
     #pragma omp target update from(data[0:local_size()])
 
-    // pack the buffers (NESW)
+    // Pack the send buffers (NESW)
     int offset = 0;
     // N
     for (int i = 1; i <= p.sub_nx; ++i, ++offset) {
@@ -192,22 +203,38 @@ struct GpuRunner::Impl {
       halo_send_buf[offset] = data[1*stride + j];
     }
 
-    // Send
-    for (int b = 0, offset = 0; b < 4; ++b) {
+    // Post non-blocking receives first
+    offset = 0;
+    for (int b = 0; b < 4; ++b) {
       if (neigh_ranks[b] != -1) {
-	MPI_Ssend(halo_send_buf.data() + offset, neigh_counts[b], MPI_INT,
-		  neigh_ranks[b], 0, p.comm);
+        MPI_Irecv(halo_recv_buf.data() + offset, neigh_counts[b], MPI_INT,
+                 neigh_ranks[b], 0, p.comm, &requests[b]);
+      } else {
+        requests[b] = MPI_REQUEST_NULL;
       }
       offset += neigh_counts[b];
     }
-    // Wait for receives
-    MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
+    
+    // Post non-blocking sends
+    offset = 0;
+    for (int b = 0; b < 4; ++b) {
+      if (neigh_ranks[b] != -1) {
+        MPI_Isend(halo_send_buf.data() + offset, neigh_counts[b], MPI_INT,
+                 neigh_ranks[b], 0, p.comm, &requests[b+4]);
+      } else {
+        requests[b+4] = MPI_REQUEST_NULL;
+      }
+      offset += neigh_counts[b];
+    }
 
-    // Unpack (NESW)
+    // Wait for all communication to complete
+    MPI_Waitall(8, requests.data(), MPI_STATUSES_IGNORE);
+
+    // Unpack received data (NESW)
     offset = 0;
     // N
     for (int i = 1; i <= p.sub_nx; ++i, ++offset) {
-      data[i * stride + p.sub_ny +1] = halo_recv_buf[offset];
+      data[i * stride + p.sub_ny + 1] = halo_recv_buf[offset];
     }
     // E
     for (int j = 1; j <= p.sub_ny; ++j, ++offset) {
@@ -222,7 +249,7 @@ struct GpuRunner::Impl {
       data[0*stride + j] = halo_recv_buf[offset];
     }
 
-    // Copy updated data back to device
+    // Update device with new halo data
     #pragma omp target update to(data[0:local_size()])
   }
 };
@@ -234,14 +261,16 @@ GpuRunner::~GpuRunner() = default;
 
 // Give each process a sub-array of size (sub_nx+2) x (sub_ny+2)
 void GpuRunner::copy_in(int const* source) {
-  // Simple host-to-device copy
+  // Copy data from host to our buffer
   std::copy(source, source + m_impl->local_size(), m_impl->state);
+  
+  // Transfer data to device
   #pragma omp target update to(m_impl->state[0:m_impl->local_size()])
 }
 
 // Give each process a sub-array of size (sub_nx+2) x (sub_ny+2)
 void GpuRunner::copy_out(int* dest) const {
-  // Simple device-to-host copy
+  // Transfer final results from device to host
   #pragma omp target update from(m_impl->state[0:m_impl->local_size()])
   std::copy(m_impl->state, m_impl->state + m_impl->local_size(), dest);
 }
@@ -250,51 +279,59 @@ void GpuRunner::copy_out(int* dest) const {
 // changes or 4 *max(M, N) iterations.
 void GpuRunner::run() {
   auto& p = m_impl->p;
-
   int const M = p.nx;
   int const N = p.ny;
   
-  // Copy initial state to device
-  #pragma omp target update to(m_impl->state[0:m_impl->local_size()])
-  std::memcpy(m_impl->tmp, m_impl->state, sizeof(int) * m_impl->local_size());
-  #pragma omp target update to(m_impl->tmp[0:m_impl->local_size()])
-
-  int const maxstep = 4 * std::max(M, N);
-  int step = 1;
-  int global_nchange = 1;
-
-  // Use pointers to the buffers (which we swap below) to avoid copies.
-  int* current = m_impl->state;
-  int* next = m_impl->tmp;
-
-  while (global_nchange && step <= maxstep) {
-    // Ensure edge sites have been communicated to neighbouring
-    // processes.
-    m_impl->halo_exchange(current);
-    
-    // Update this process's subdomain
-    int local_nchange = percolate_gpu_step(p.sub_nx, p.sub_ny, current, next);
-
-    // Share the total changes to make a decision
-    MPI_Allreduce(&local_nchange,
-		  &global_nchange,
-		  1, MPI_INT, MPI_SUM, p.comm);
-
-    if (step % printfreq == 0) {
-      p.print_root("percolate: number of changes on step {} is {}\n",
-		   step, global_nchange);
+  // Use persistent device data mapping for improved performance
+  #pragma omp target data map(to:m_impl->state[0:m_impl->local_size()], m_impl->tmp[0:m_impl->local_size()]) \
+                         map(from:m_impl->state[0:m_impl->local_size()])
+  {
+    // Initialize tmp on device
+    #pragma omp target teams distribute parallel for collapse(2)
+    for (int i = 0; i < p.sub_nx + 2; ++i) {
+      for (int j = 0; j < p.sub_ny + 2; ++j) {
+        m_impl->tmp[i*(p.sub_ny+2) + j] = m_impl->state[i*(p.sub_ny+2) + j];
+      }
     }
 
-    // Swap the pointers for the next iteration
-    std::swap(next, current);
-    step++;
-  }
+    int const maxstep = 4 * std::max(M, N);
+    int step = 1;
+    int global_nchange = 1;
 
-  // Ensure final state is on host
-  #pragma omp target update from(current[0:m_impl->local_size()])
-  
-  // Answer now in `current`, make sure this one is in `state`
-  if (current != m_impl->state) {
-    std::memcpy(m_impl->state, current, sizeof(int) * m_impl->local_size());
-  }
+    // Use pointers to the buffers which we swap to avoid copies
+    int* current = m_impl->state;
+    int* next = m_impl->tmp;
+
+    while (global_nchange && step <= maxstep) {
+      // Exchange halos with neighboring processes
+      m_impl->halo_exchange(current);
+      
+      // Run the computation kernel
+      int local_nchange = percolate_gpu_step(p.sub_nx, p.sub_ny, current, next);
+
+      // Share the total changes
+      MPI_Allreduce(&local_nchange,
+                   &global_nchange,
+                   1, MPI_INT, MPI_SUM, p.comm);
+
+      if (step % printfreq == 0 && p.rank == 0) {
+        p.print_root("percolate: number of changes on step {} is {}\n",
+                    step, global_nchange);
+      }
+
+      // Swap the pointers for the next iteration
+      std::swap(next, current);
+      step++;
+    }
+
+    // Ensure final state is in m_impl->state
+    if (current != m_impl->state) {
+      #pragma omp target teams distribute parallel for collapse(2)
+      for (int i = 0; i < p.sub_nx + 2; ++i) {
+        for (int j = 0; j < p.sub_ny + 2; ++j) {
+          m_impl->state[i*(p.sub_ny+2) + j] = current[i*(p.sub_ny+2) + j];
+        }
+      }
+    }
+  } // End of target data region
 }
