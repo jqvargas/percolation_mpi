@@ -100,9 +100,9 @@ struct GpuRunner::Impl {
       // Check if we can actually use this device
       omp_set_default_device(device_id);
       if (!omp_is_initial_device()) {
-        p.print("Process {} on node {} assigned to GPU {}\n", p.rank, node_rank, device_id);
+        p.print_root("Process {} on node {} assigned to GPU {}\n", p.rank, node_rank, device_id);
       } else {
-        p.print("Process {} on node {} failed to get GPU {}, falling back to CPU\n", p.rank, node_rank, device_id);
+        p.print_root("Process {} on node {} failed to get GPU {}, falling back to CPU\n", p.rank, node_rank, device_id);
         device_id = -1;
       }
     }
@@ -156,7 +156,7 @@ struct GpuRunner::Impl {
         #pragma omp target exit data map(delete: tmp[0:local_size()])
       } catch (...) {
         // Ignore errors during cleanup
-        p.print("Warning: Error during GPU memory cleanup\n");
+        p.print_root("Warning: Error during GPU memory cleanup\n");
       }
     }
     delete[] state;
@@ -380,7 +380,7 @@ void GpuRunner::run() {
   
   // If no GPU is available, run on CPU
   if (m_impl->device_id < 0) {
-    p.print("Process {} running on CPU\n", p.rank);
+    p.print_root("Process {} running on CPU\n", p.rank);
     
     int const maxstep = 4 * std::max(M, N);
     int step = 1;
@@ -438,7 +438,7 @@ void GpuRunner::run() {
     }
   } 
   else { // GPU execution path
-    p.print("Process {} running on GPU {}\n", p.rank, m_impl->device_id);
+    p.print_root("Process {} running on GPU {}\n", p.rank, m_impl->device_id);
     
     // Use persistent device data mapping for improved performance
     #pragma omp target data map(to:m_impl->state[0:m_impl->local_size()], m_impl->tmp[0:m_impl->local_size()]) \
@@ -493,7 +493,7 @@ void GpuRunner::run() {
           }
         }
       } catch (const std::exception& e) {
-        p.print("Error during GPU execution: {}\n", e.what());
+        p.print_root("Error during GPU execution: {}\n", e.what());
         throw; // Re-throw to ensure clean exit
       }
     } // End of target data region
