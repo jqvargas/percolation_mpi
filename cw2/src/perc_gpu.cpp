@@ -31,9 +31,13 @@ static int percolate_gpu_step(int M, int N, int const* state, int* next) {
   int nchange = 0;
   int const stride = N + 2;
 
+  // Calculate optimal team and thread configuration
+  int block_size = 256; // Typical good value for NVIDIA GPUs
+  int num_teams = (M * N + block_size - 1) / block_size;
+
   // Enhanced GPU kernel with explicit mapping
   #pragma omp target teams distribute parallel for collapse(2) \
-    reduction(+:nchange)
+    reduction(+:nchange) num_teams(num_teams) thread_limit(block_size)
   for (int i = 1; i <= M; ++i) {
     for (int j = 1; j <= N; ++j) {
       int const idx = i*stride + j;
@@ -86,10 +90,10 @@ struct GpuRunner::Impl {
     MPI_Comm_split_type(p.comm, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node_comm);
     MPI_Comm_rank(node_comm, &node_rank);
 
-    // Get number of available GPUs
+    // Get number of available GPUs (non-host devices)
     int num_devices = omp_get_num_devices();
     
-    // Be more defensive about GPU availability
+    // Check if any non-host devices are available
     if (num_devices == 0) {
       p.print_root("Warning: No GPU devices available, falling back to CPU\n");
       device_id = -1;
@@ -97,12 +101,26 @@ struct GpuRunner::Impl {
       // Assign GPU in round-robin fashion within each node
       device_id = node_rank % num_devices;
       
-      // Check if we can actually use this device
+      // Set the default device
       omp_set_default_device(device_id);
-      if (!omp_is_initial_device()) {
-        p.print_root("Process {} on node {} assigned to GPU {}\n", p.rank, node_rank, device_id);
+      
+      // Verify the device can be used by trying to allocate a small amount of memory
+      int* test_ptr = nullptr;
+      int device_usable = 0;
+      
+      #pragma omp target enter data map(alloc: test_ptr[0:1])
+      {
+        // This block only executes if target device is available
+        device_usable = 1;
+      }
+      
+      if (device_usable) {
+        p.print_root("Process {} on node {} successfully assigned to GPU {}\n", p.rank, node_rank, device_id);
+        
+        // Free the test allocation
+        #pragma omp target exit data map(delete: test_ptr[0:1])
       } else {
-        p.print_root("Process {} on node {} failed to get GPU {}, falling back to CPU\n", p.rank, node_rank, device_id);
+        p.print_root("Process {} on node {} failed to access GPU {}, falling back to CPU\n", p.rank, node_rank, device_id);
         device_id = -1;
       }
     }
@@ -177,7 +195,11 @@ struct GpuRunner::Impl {
     if (device_id >= 0) {
       // GPU path: copy from device to host
       std::vector<int> host_data(local_size());
-      #pragma omp target update from(data[0:local_size()])
+      
+      // Use explicit synchronization before copying from device
+      #pragma omp target update from(data[0:local_size()]) nowait depend(out:data[0:local_size()])
+      #pragma omp taskwait
+      
       std::copy(data, data + local_size(), host_data.data());
       
       // Post receives first
@@ -253,7 +275,10 @@ struct GpuRunner::Impl {
       
       // Copy the updated data back to the original array and to the device
       std::copy(host_data.data(), host_data.data() + local_size(), data);
-      #pragma omp target update to(data[0:local_size()])
+      
+      // Use explicit synchronization for device update
+      #pragma omp target update to(data[0:local_size()]) nowait depend(in:data[0:local_size()])
+      #pragma omp taskwait
       
       // Wait for sends to complete
       for (int b = 4; b < 8; ++b) {
@@ -358,7 +383,9 @@ void GpuRunner::copy_in(int const* source) {
   
   // Only transfer to device if we're using a GPU
   if (m_impl->device_id >= 0) {
-    #pragma omp target update to(m_impl->state[0:m_impl->local_size()])
+    // Use more explicit synchronization
+    #pragma omp target update to(m_impl->state[0:m_impl->local_size()]) nowait
+    #pragma omp taskwait
   }
 }
 
@@ -366,7 +393,9 @@ void GpuRunner::copy_in(int const* source) {
 void GpuRunner::copy_out(int* dest) const {
   // Only transfer from device if we're using a GPU
   if (m_impl->device_id >= 0) {
-    #pragma omp target update from(m_impl->state[0:m_impl->local_size()])
+    // Use more explicit synchronization
+    #pragma omp target update from(m_impl->state[0:m_impl->local_size()]) nowait
+    #pragma omp taskwait
   }
   std::copy(m_impl->state, m_impl->state + m_impl->local_size(), dest);
 }
