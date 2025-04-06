@@ -18,7 +18,8 @@ module load cmake
 
 # Set environment variables for GPU visibility
 export NVCOMPILER_ACC_GPU_TARGET=cc70
-export NVCOMPILER_CUDA_HOME=/opt/nvidia/hpc_sdk/Linux_x86_64/24.5/cuda/12.4
+export NVCOMPILER_CUDA_HOME=/opt/nvidia/hpc_sdk/Linux_x86_64/24.5/cuda
+export CUDA_HOME=/opt/nvidia/hpc_sdk/Linux_x86_64/24.5/cuda
 
 # Set MPI environment variables to help CMake find MPI
 export MPI_C_COMPILER=$(which mpicc)

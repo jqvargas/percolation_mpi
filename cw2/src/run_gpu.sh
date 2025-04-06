@@ -19,6 +19,10 @@ module load openmpi/4.1.6-cuda-12.4
 
 # Set critical environment variables for GPU visibility
 export NVCOMPILER_ACC_GPU_TARGET=cc70
+export NVCOMPILER_CUDA_HOME=/opt/nvidia/hpc_sdk/Linux_x86_64/24.5/cuda
+export CUDA_HOME=/opt/nvidia/hpc_sdk/Linux_x86_64/24.5/cuda
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 
 # Display GPU information
