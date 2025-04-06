@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
 #SBATCH --partition=gpu
-#SBATCH --account=your-account-name
+#SBATCH --account=<your_cirrus_budget_code>
 
 # Print info about the job
 echo "Running on nodes: $SLURM_NODELIST"

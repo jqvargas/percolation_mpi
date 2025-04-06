@@ -30,6 +30,12 @@ set(ACC_MODEL "None" CACHE STRING
 
 set(CMAKE_CXX_STANDARD 17)
 
+# Set MPI compiler wrappers explicitly if using NVHPC
+if (CMAKE_CXX_COMPILER_ID STREQUAL NVHPC)
+  set(MPI_CXX_COMPILER mpicxx CACHE STRING "MPI C++ compiler wrapper")
+  set(MPI_C_COMPILER mpicc CACHE STRING "MPI C compiler wrapper")
+endif()
+
 if (ACC_MODEL STREQUAL None)
   # No per-process acceleration. Not much use!
   message(WARNING "No accelerator programming model selected! Set ACC_MODEL!")
@@ -70,6 +76,13 @@ elseif (ACC_MODEL STREQUAL CUDA)
 else()
   message(FATAL_ERROR "Invalid value of ACC_MODEL = '${ACC_MODEL}'")
 
+endif()
+
+# Special handling for MPI with NVHPC compiler
+if (CMAKE_CXX_COMPILER_ID STREQUAL NVHPC)
+  # Force MPI to be found regardless of compiler test
+  set(MPI_CXX_WORKS TRUE CACHE BOOL "Force MPI CXX to work" FORCE)
+  set(MPI_C_WORKS TRUE CACHE BOOL "Force MPI C to work" FORCE)
 endif()
 
 find_package(MPI REQUIRED)

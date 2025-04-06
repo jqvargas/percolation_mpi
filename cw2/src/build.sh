@@ -20,6 +20,11 @@ module load cmake
 export NVCOMPILER_ACC_GPU_TARGET=cc70
 export NVCOMPILER_CUDA_HOME=/opt/nvidia/hpc_sdk/Linux_x86_64/24.5/cuda/12.4
 
+# Set MPI environment variables to help CMake find MPI
+export MPI_C_COMPILER=$(which mpicc)
+export MPI_CXX_COMPILER=$(which mpicxx)
+export OMPI_CXX=nvc++
+
 # Create build directory if it doesn't exist
 mkdir -p build
 
@@ -28,7 +33,9 @@ echo "Configuring CMake with OpenMP offloading..."
 cmake -S . -B build \
     -DACC_MODEL=OpenMP \
     -DCMAKE_CXX_COMPILER=nvc++ \
-    -DCMAKE_BUILD_TYPE=RelWithDebInfo
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DMPI_CXX_COMPILER=$(which mpicxx) \
+    -DMPI_C_COMPILER=$(which mpicc)
 
 # Build the project
 echo "Building the project..."
