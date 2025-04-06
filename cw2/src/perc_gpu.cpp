@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "decomp.h"
+#include <omp.h>
 
 constexpr int printfreq = 100;
 
