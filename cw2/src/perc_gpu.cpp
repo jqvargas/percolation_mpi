@@ -62,114 +62,76 @@ static int percolate_gpu_step(int M, int N, int const* state, int* next) {
 
 
 struct GpuRunner::Impl {
-  // Here you can store any parameters or data needed for
-  // implementation of your version.
-
   ParallelDecomp p;
-
-  // Device management
-  int device_id; // Assigned GPU device ID
-  int node_id;   // Node ID
-  char hostname[MPI_MAX_PROCESSOR_NAME]; // Hostname for better debugging
-
-  // Use managed memory for efficient host-device transfers
   int* state;
   int* tmp;
 
-  // Neighbouring ranks. -1 => no neighbour
-  // Ordering is NESW
+  // Add node communicator and device management
+  MPI_Comm node_comm;
+  int node_rank;
+  int device_id;
+
   std::array<int, 4> neigh_ranks;
   std::array<int, 4> neigh_counts;
 
-  // Halo exchange buffers
-  std::vector<int> halo_send_buf;
-  std::vector<int> halo_recv_buf;
-
-  // MPI request arrays for non-blocking communication
-  std::array<MPI_Request, 8> requests;  // 4 sends + 4 receives
+  // Separate buffers for each boundary
+  std::array<std::vector<int>, 4> halo_send_bufs;
+  std::array<std::vector<int>, 4> halo_recv_bufs;
 
   Impl(ParallelDecomp const& pd) : p(pd) {
-    // Get hostname for better debugging
-    int namelen;
-    MPI_Get_processor_name(hostname, &namelen);
-    
-    // Set up device assignment using MPI_Comm_split_type
-    MPI_Comm node_comm;
-    int node_rank;
-    
-    // Split communicator by node
+    // Create a communicator for processes on the same node
     MPI_Comm_split_type(p.comm, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node_comm);
     MPI_Comm_rank(node_comm, &node_rank);
-    
-    // Get node ID (this requires all processes on a node to have consecutive ranks)
-    int node_size;
-    MPI_Comm_size(node_comm, &node_size);
-    node_id = p.rank / node_size;
-    
-    // Get number of devices on this node
-    int num_devices = 0;
-    #pragma omp parallel
-    {
-      #pragma omp single
-      {
-        num_devices = omp_get_num_devices();
-      }
-    }
-    
-    // Assign device (round-robin within each node)
-    if (num_devices > 0) {
-      device_id = node_rank % num_devices;
-    } else {
-      device_id = 0; // Fallback to device 0 if no devices found
-    }
-    
-    // Print assignment for debugging
-    printf("Rank %d on node %d (hostname: %s) assigned to GPU device %d of %d available devices\n", 
-           p.rank, node_id, hostname, device_id, num_devices);
-    
-    // Set default device
-    omp_set_default_device(device_id);
-    
-    // Free the communicator
-    MPI_Comm_free(&node_comm);
 
-    // Allocate memory - using persistent target data constructs
+    // Get number of available GPUs
+    int num_devices = omp_get_num_devices();
+    if (num_devices == 0) {
+      p.print_root("Warning: No GPU devices available, falling back to CPU\n");
+      device_id = -1;
+    } else {
+      // Assign GPU in round-robin fashion within each node
+      device_id = node_rank % num_devices;
+      p.print_root("Process {} on node {} assigned to GPU {}\n", p.rank, node_rank, device_id);
+    }
+
+    // Set the device for this process
+    omp_set_default_device(device_id);
+
     state = new int[local_size()];
     tmp = new int[local_size()];
-    
-    // Initialize device memory
-    #pragma omp target enter data map(alloc: state[0:local_size()], tmp[0:local_size()])
 
-    // Neighbour ranks: NESW
-    // N: (pi, pj + 1)
-    neigh_ranks[0] = (p.pj + 1 < p.py) ? p.global_rank(p.pi, p.pj + 1) : -1;
+    // Initialize device memory if GPU is available
+    if (device_id >= 0) {
+      #pragma omp target enter data map(alloc: state[0:local_size()], tmp[0:local_size()])
+    }
+
+    // Neighbor ranks and counts
+    neigh_ranks[0] = (p.pj + 1 < p.py) ? p.global_rank(p.pi, p.pj + 1) : -1; // top
     neigh_counts[0] = p.sub_nx;
-    // E: (pi + 1, pj)
-    neigh_ranks[1] = (p.pi + 1 < p.px) ? p.global_rank(p.pi + 1, p.pj) : -1;
+    neigh_ranks[1] = (p.pi + 1 < p.px) ? p.global_rank(p.pi + 1, p.pj) : -1; // right
     neigh_counts[1] = p.sub_ny;
-    // S: (pi, pj - 1)
-    neigh_ranks[2] = (p.pj - 1 >= 0) ? p.global_rank(p.pi, p.pj - 1) : -1;
+    neigh_ranks[2] = (p.pj - 1 >= 0) ? p.global_rank(p.pi, p.pj - 1) : -1; // bottom
     neigh_counts[2] = p.sub_nx;
-    // W: (pi - 1, pj)
-    neigh_ranks[3] = (p.pi - 1 >= 0) ? p.global_rank(p.pi - 1, p.pj) : -1;
+    neigh_ranks[3] = (p.pi - 1 >= 0) ? p.global_rank(p.pi - 1, p.pj) : -1; // left
     neigh_counts[3] = p.sub_ny;
 
-    // Allocate halo buffers
-    auto halo_buf_size = 2 * (p.sub_nx + p.sub_ny);
-    halo_send_buf.resize(halo_buf_size);
-    halo_recv_buf.resize(halo_buf_size);
-
-    // Initialize requests array
-    for (auto& req : requests) {
-      req = MPI_REQUEST_NULL;
+    // Initialize separate buffers for each boundary
+    for (int i = 0; i < 4; ++i) {
+      if (neigh_ranks[i] != -1) {
+        halo_send_bufs[i].resize(neigh_counts[i]);
+        halo_recv_bufs[i].resize(neigh_counts[i]);
+      }
     }
   }
     
   ~Impl() {
-    // Clean up device memory
-    #pragma omp target exit data map(delete: state[0:local_size()], tmp[0:local_size()])
+    // Clean up device memory if GPU was used
+    if (device_id >= 0) {
+      #pragma omp target exit data map(delete: state[0:local_size()], tmp[0:local_size()])
+    }
     delete[] state;
     delete[] tmp;
+    MPI_Comm_free(&node_comm);
   }
 
   int local_size() const {
@@ -188,26 +150,26 @@ struct GpuRunner::Impl {
     int offset = 0;
     // N
     for (int i = 1; i <= p.sub_nx; ++i, ++offset) {
-      halo_send_buf[offset] = data[i * stride + p.sub_ny];
+      halo_send_bufs[0][offset] = data[i * stride + p.sub_ny];
     }
     // E
     for (int j = 1; j <= p.sub_ny; ++j, ++offset) {
-      halo_send_buf[offset] = data[p.sub_nx * stride + j];
+      halo_send_bufs[1][offset] = data[p.sub_nx * stride + j];
     }
     // S
     for (int i = 1; i <= p.sub_nx; ++i, ++offset) {
-      halo_send_buf[offset] = data[i * stride + 1];
+      halo_send_bufs[2][offset] = data[i * stride + 1];
     }
     // W
     for (int j = 1; j <= p.sub_ny; ++j, ++offset) {
-      halo_send_buf[offset] = data[1*stride + j];
+      halo_send_bufs[3][offset] = data[1*stride + j];
     }
 
     // Post non-blocking receives first
     offset = 0;
     for (int b = 0; b < 4; ++b) {
       if (neigh_ranks[b] != -1) {
-        MPI_Irecv(halo_recv_buf.data() + offset, neigh_counts[b], MPI_INT,
+        MPI_Irecv(halo_recv_bufs[b].data() + offset, neigh_counts[b], MPI_INT,
                  neigh_ranks[b], 0, p.comm, &requests[b]);
       } else {
         requests[b] = MPI_REQUEST_NULL;
@@ -219,7 +181,7 @@ struct GpuRunner::Impl {
     offset = 0;
     for (int b = 0; b < 4; ++b) {
       if (neigh_ranks[b] != -1) {
-        MPI_Isend(halo_send_buf.data() + offset, neigh_counts[b], MPI_INT,
+        MPI_Isend(halo_send_bufs[b].data() + offset, neigh_counts[b], MPI_INT,
                  neigh_ranks[b], 0, p.comm, &requests[b+4]);
       } else {
         requests[b+4] = MPI_REQUEST_NULL;
@@ -234,19 +196,19 @@ struct GpuRunner::Impl {
     offset = 0;
     // N
     for (int i = 1; i <= p.sub_nx; ++i, ++offset) {
-      data[i * stride + p.sub_ny + 1] = halo_recv_buf[offset];
+      data[i * stride + p.sub_ny + 1] = halo_recv_bufs[0][offset];
     }
     // E
     for (int j = 1; j <= p.sub_ny; ++j, ++offset) {
-      data[(p.sub_nx + 1) * stride + j] = halo_recv_buf[offset];
+      data[(p.sub_nx + 1) * stride + j] = halo_recv_bufs[1][offset];
     }
     // S
     for (int i = 1; i <= p.sub_nx; ++i, ++offset) {
-      data[i * stride + 0] = halo_recv_buf[offset];
+      data[i * stride + 0] = halo_recv_bufs[2][offset];
     }
     // W
     for (int j = 1; j <= p.sub_ny; ++j, ++offset) {
-      data[0*stride + j] = halo_recv_buf[offset];
+      data[0*stride + j] = halo_recv_bufs[3][offset];
     }
 
     // Update device with new halo data
