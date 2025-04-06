@@ -78,6 +78,9 @@ struct GpuRunner::Impl {
   std::array<std::vector<int>, 4> halo_send_bufs;
   std::array<std::vector<int>, 4> halo_recv_bufs;
 
+  // MPI request handles for non-blocking communication
+  std::array<MPI_Request, 8> requests;  // 4 for receives, 4 for sends
+
   Impl(ParallelDecomp const& pd) : p(pd) {
     // Create a communicator for processes on the same node
     MPI_Comm_split_type(p.comm, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node_comm);
@@ -122,6 +125,11 @@ struct GpuRunner::Impl {
         halo_recv_bufs[i].resize(neigh_counts[i]);
       }
     }
+
+    // Initialize MPI requests
+    for (auto& req : requests) {
+      req = MPI_REQUEST_NULL;
+    }
   }
     
   ~Impl() {
@@ -142,77 +150,96 @@ struct GpuRunner::Impl {
   // halos on the receiving side using non-blocking communication
   void halo_exchange(int* data) {
     auto const stride = p.sub_ny + 2;
-    
-    // Copy boundary data from device to host for sending
-    #pragma omp target update from(data[0:local_size()])
 
-    // Pack the send buffers (NESW)
-    int offset = 0;
-    // N
-    for (int i = 1; i <= p.sub_nx; ++i, ++offset) {
-      halo_send_bufs[0][offset] = data[i * stride + p.sub_ny];
-    }
-    // E
-    for (int j = 1; j <= p.sub_ny; ++j, ++offset) {
-      halo_send_bufs[1][offset] = data[p.sub_nx * stride + j];
-    }
-    // S
-    for (int i = 1; i <= p.sub_nx; ++i, ++offset) {
-      halo_send_bufs[2][offset] = data[i * stride + 1];
-    }
-    // W
-    for (int j = 1; j <= p.sub_ny; ++j, ++offset) {
-      halo_send_bufs[3][offset] = data[1*stride + j];
-    }
-
-    // Post non-blocking receives first
-    offset = 0;
+    // Post receives first
     for (int b = 0; b < 4; ++b) {
       if (neigh_ranks[b] != -1) {
-        MPI_Irecv(halo_recv_bufs[b].data() + offset, neigh_counts[b], MPI_INT,
+        MPI_Irecv(halo_recv_bufs[b].data(), neigh_counts[b], MPI_INT,
                  neigh_ranks[b], 0, p.comm, &requests[b]);
       } else {
         requests[b] = MPI_REQUEST_NULL;
       }
-      offset += neigh_counts[b];
     }
-    
-    // Post non-blocking sends
-    offset = 0;
+
+    // Update only the boundary regions from device to host
+    #pragma omp target update from(data[1*stride + p.sub_ny:p.sub_nx]) // top boundary
+    #pragma omp target update from(data[p.sub_nx*stride + 1:p.sub_ny]) // right boundary
+    #pragma omp target update from(data[1*stride + 1:p.sub_nx]) // bottom boundary
+    #pragma omp target update from(data[1*stride + 1:p.sub_ny]) // left boundary
+
+    // Pack boundary data into separate buffers
+    if (neigh_ranks[0] != -1) { // top
+      for (int i = 0; i < p.sub_nx; ++i) {
+        halo_send_bufs[0][i] = data[(i+1)*stride + p.sub_ny];
+      }
+    }
+    if (neigh_ranks[1] != -1) { // right
+      for (int j = 0; j < p.sub_ny; ++j) {
+        halo_send_bufs[1][j] = data[p.sub_nx*stride + (j+1)];
+      }
+    }
+    if (neigh_ranks[2] != -1) { // bottom
+      for (int i = 0; i < p.sub_nx; ++i) {
+        halo_send_bufs[2][i] = data[(i+1)*stride + 1];
+      }
+    }
+    if (neigh_ranks[3] != -1) { // left
+      for (int j = 0; j < p.sub_ny; ++j) {
+        halo_send_bufs[3][j] = data[1*stride + (j+1)];
+      }
+    }
+
+    // Send boundary data
     for (int b = 0; b < 4; ++b) {
       if (neigh_ranks[b] != -1) {
-        MPI_Isend(halo_send_bufs[b].data() + offset, neigh_counts[b], MPI_INT,
+        MPI_Isend(halo_send_bufs[b].data(), neigh_counts[b], MPI_INT,
                  neigh_ranks[b], 0, p.comm, &requests[b+4]);
       } else {
         requests[b+4] = MPI_REQUEST_NULL;
       }
-      offset += neigh_counts[b];
     }
 
-    // Wait for all communication to complete
-    MPI_Waitall(8, requests.data(), MPI_STATUSES_IGNORE);
-
-    // Unpack received data (NESW)
-    offset = 0;
-    // N
-    for (int i = 1; i <= p.sub_nx; ++i, ++offset) {
-      data[i * stride + p.sub_ny + 1] = halo_recv_bufs[0][offset];
-    }
-    // E
-    for (int j = 1; j <= p.sub_ny; ++j, ++offset) {
-      data[(p.sub_nx + 1) * stride + j] = halo_recv_bufs[1][offset];
-    }
-    // S
-    for (int i = 1; i <= p.sub_nx; ++i, ++offset) {
-      data[i * stride + 0] = halo_recv_bufs[2][offset];
-    }
-    // W
-    for (int j = 1; j <= p.sub_ny; ++j, ++offset) {
-      data[0*stride + j] = halo_recv_bufs[3][offset];
+    // Wait for receives to complete
+    for (int b = 0; b < 4; ++b) {
+      if (neigh_ranks[b] != -1) {
+        MPI_Wait(&requests[b], MPI_STATUS_IGNORE);
+      }
     }
 
-    // Update device with new halo data
-    #pragma omp target update to(data[0:local_size()])
+    // Unpack received data
+    if (neigh_ranks[0] != -1) { // top
+      for (int i = 0; i < p.sub_nx; ++i) {
+        data[(i+1)*stride + p.sub_ny + 1] = halo_recv_bufs[0][i];
+      }
+    }
+    if (neigh_ranks[1] != -1) { // right
+      for (int j = 0; j < p.sub_ny; ++j) {
+        data[(p.sub_nx + 1)*stride + (j+1)] = halo_recv_bufs[1][j];
+      }
+    }
+    if (neigh_ranks[2] != -1) { // bottom
+      for (int i = 0; i < p.sub_nx; ++i) {
+        data[(i+1)*stride + 0] = halo_recv_bufs[2][i];
+      }
+    }
+    if (neigh_ranks[3] != -1) { // left
+      for (int j = 0; j < p.sub_ny; ++j) {
+        data[0*stride + (j+1)] = halo_recv_bufs[3][j];
+      }
+    }
+
+    // Update only the halo regions on device
+    #pragma omp target update to(data[1*stride + p.sub_ny + 1:p.sub_nx]) // top halo
+    #pragma omp target update to(data[(p.sub_nx + 1)*stride + 1:p.sub_ny]) // right halo
+    #pragma omp target update to(data[1*stride + 0:p.sub_nx]) // bottom halo
+    #pragma omp target update to(data[0*stride + 1:p.sub_ny]) // left halo
+
+    // Wait for sends to complete
+    for (int b = 4; b < 8; ++b) {
+      if (neigh_ranks[b-4] != -1) {
+        MPI_Wait(&requests[b], MPI_STATUS_IGNORE);
+      }
+    }
   }
 };
 
