@@ -1,0 +1,6 @@
+*.png
+slurm-*.out
+*.ncu-rep
+*.qdrep
+*~
+build*
