@@ -374,7 +374,8 @@ void GpuRunner::run() {
   if (p.rank == 0) {
     // Count total GPUs being used
     int total_used_gpus = 0;
-    MPI_Reduce(&(m_impl->using_gpu ? 1 : 0), &total_used_gpus, 1, MPI_INT, MPI_SUM, 0, p.comm);
+    int using_gpu_val = m_impl->using_gpu ? 1 : 0;
+    MPI_Reduce(&using_gpu_val, &total_used_gpus, 1, MPI_INT, MPI_SUM, 0, p.comm);
     
     // Get world size
     int world_size;
