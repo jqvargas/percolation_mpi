@@ -427,34 +427,26 @@ void GpuRunner::run() {
       local_nchange = 0;
       int const stride = p.sub_ny + 2;
       
-      // Use OpenMP parallel CPU implementation with simple optimizations
-      #pragma omp parallel for collapse(2) reduction(+:local_nchange)
       for (int i = 1; i <= p.sub_nx; ++i) {
         for (int j = 1; j <= p.sub_ny; ++j) {
           int const idx = i*stride + j;
           int const oldval = current[idx];
-          
-          // Skip solid cells early for better branch prediction
-          if (oldval == 0) {
-            next[idx] = 0;
-            continue;
-          }
-          
-          // Inline max calculations for better performance
           int newval = oldval;
-          int n1 = current[(i-1)*stride + j];
-          int n2 = current[(i+1)*stride + j];
-          int n3 = current[i*stride + j-1];
-          int n4 = current[i*stride + j+1];
-          
-          newval = (n1 > newval) ? n1 : newval;
-          newval = (n2 > newval) ? n2 : newval;
-          newval = (n3 > newval) ? n3 : newval;
-          newval = (n4 > newval) ? n4 : newval;
-          
-          // Count changes
-          local_nchange += (newval != oldval);
-          
+
+          // 0 => solid, so do nothing
+          if (oldval != 0) {
+            // Set next[i][j] to be the maximum value of state[i][j] and
+            // its four nearest neighbours
+            newval = std::max(newval, current[(i-1)*stride + j  ]);
+            newval = std::max(newval, current[(i+1)*stride + j  ]);
+            newval = std::max(newval, current[    i*stride + j-1]);
+            newval = std::max(newval, current[    i*stride + j+1]);
+
+            if (newval != oldval) {
+              ++local_nchange;
+            }
+          }
+
           next[idx] = newval;
         }
       }
