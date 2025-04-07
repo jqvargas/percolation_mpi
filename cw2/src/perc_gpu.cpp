@@ -10,6 +10,15 @@
 // version may constitute academic misconduct under the University's
 // regulations.
 
+#include <memory>
+#include <algorithm>
+#include <numeric>
+#include <vector>
+#include <array>
+#include <cstring>
+#include <unistd.h> // For gethostname
+#include "util.h"
+#include "decomp.h"
 #include "perc_gpu.h"
 
 #include <cstdio>
@@ -107,13 +116,38 @@ struct GpuRunner::Impl {
     using_gpu = false;
     device_id = -1;
     
+    // Print basic information from all processes
+    char hostname[256];
+    gethostname(hostname, sizeof(hostname));
+    
+    // Gather information from all processes to print on root
+    struct {
+      int global_rank;
+      int node_rank;
+      int num_devices;
+      int assigned_device;
+      char hostname[256];
+    } my_info, *all_info = nullptr;
+    
+    // Fill in local info
+    my_info.global_rank = p.rank;
+    my_info.node_rank = node_rank;
+    my_info.num_devices = num_devices;
+    my_info.assigned_device = -1;  // Will be set later
+    strncpy(my_info.hostname, hostname, sizeof(my_info.hostname));
+    
+    // Allocate buffer on root process
+    int world_size;
+    MPI_Comm_size(p.comm, &world_size);
+    if (p.rank == 0) {
+        all_info = new decltype(my_info)[world_size];
+    }
+    
     if (num_devices > 0) {
       // We have GPUs available
       // Assign GPU in round-robin fashion within the node (4 GPUs per node)
       device_id = node_rank % num_devices;
-      
-      p.print_root("Process {} (global) / {} (node local) assigned to GPU {}\n", 
-                   p.rank, node_rank, device_id);
+      my_info.assigned_device = device_id;
       
       // Set this device as the default for OpenMP
       omp_set_default_device(device_id);
@@ -126,16 +160,39 @@ struct GpuRunner::Impl {
       }
       
       if (is_device_usable) {
-        p.print_root("Process {} successfully using GPU {}\n", p.rank, device_id);
         using_gpu = true;
       } else {
-        p.print_root("Process {} failed to access GPU {}, falling back to CPU\n", 
-                     p.rank, device_id);
         device_id = -1;
+        my_info.assigned_device = -1;
         using_gpu = false;
       }
-    } else {
-      p.print_root("No GPU devices detected for process {}, using CPU\n", p.rank);
+    }
+    
+    // Gather all information to root process
+    MPI_Gather(&my_info, sizeof(my_info), MPI_BYTE, 
+               all_info, sizeof(my_info), MPI_BYTE, 
+               0, p.comm);
+    
+    // Print summary on root process
+    if (p.rank == 0) {
+        printf("\n==== GPU Assignment Summary ====\n");
+        printf("%-6s %-10s %-10s %-8s %-8s %s\n", 
+               "Rank", "Node Rank", "Hostname", "GPUs", "Using", "Status");
+        printf("-----------------------------------------------------------\n");
+        
+        for (int i = 0; i < world_size; i++) {
+            printf("%-6d %-10d %-10s %-8d %-8d %s\n", 
+                   all_info[i].global_rank, 
+                   all_info[i].node_rank,
+                   all_info[i].hostname,
+                   all_info[i].num_devices,
+                   all_info[i].assigned_device,
+                   all_info[i].assigned_device >= 0 ? "GPU" : "CPU (fallback)");
+        }
+        printf("==== End GPU Assignment Summary ====\n\n");
+        
+        // Clean up
+        delete[] all_info;
     }
 
     state = new int[local_size()];
@@ -313,6 +370,27 @@ void GpuRunner::run() {
   int const M = p.nx;
   int const N = p.ny;
   
+  // Log GPU utilization at the start
+  if (p.rank == 0) {
+    // Count total GPUs being used
+    int total_used_gpus = 0;
+    MPI_Reduce(&(m_impl->using_gpu ? 1 : 0), &total_used_gpus, 1, MPI_INT, MPI_SUM, 0, p.comm);
+    
+    // Get world size
+    int world_size;
+    MPI_Comm_size(p.comm, &world_size);
+    
+    printf("\n==== GPU Utilization ====\n");
+    printf("Total processes: %d\n", world_size);
+    printf("Processes using GPU: %d (%.1f%%)\n", total_used_gpus, 
+           (100.0 * total_used_gpus) / world_size);
+    printf("========================\n\n");
+  } else {
+    // Non-root processes just participate in the reduction
+    int using_gpu = m_impl->using_gpu ? 1 : 0;
+    MPI_Reduce(&using_gpu, nullptr, 1, MPI_INT, MPI_SUM, 0, p.comm);
+  }
+  
   // Copy the initial state to the tmp, only the global halos are
   // *required*, but much easier this way!
   std::memcpy(m_impl->tmp, m_impl->state, sizeof(int) * m_impl->local_size());
@@ -401,4 +479,11 @@ void GpuRunner::run() {
   // Update pointers
   m_impl->state = current;
   m_impl->tmp = next;
+  
+  // Log final step count by GPU/CPU usage
+  if (p.rank == 0) {
+    printf("\n==== Percolation Complete ====\n");
+    printf("Completed in %d steps (max allowed: %d)\n", step, maxstep);
+    printf("============================\n\n");
+  }
 }
