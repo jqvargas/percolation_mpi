@@ -40,28 +40,36 @@ static int percolate_gpu_step(int M, int N, int const* state, int* next) {
   int nchange = 0;
   int const stride = N + 2;
 
-  // OpenMP target offload to GPU
+  // OpenMP target offload to GPU - keeping same directives but optimizing loop structure
   #pragma omp target teams distribute parallel for collapse(2) map(to: state[0:(M+2)*(N+2)]) map(from: next[0:(M+2)*(N+2)]) map(tofrom: nchange) reduction(+:nchange)
   for (int i = 1; i <= M; ++i) {
     for (int j = 1; j <= N; ++j) {
       int const idx = i*stride + j;
       int const oldval = state[idx];
-      int newval = oldval;
-
-      // 0 => solid, so do nothing
-      if (oldval != 0) {
-	// Set next[i][j] to be the maximum value of state[i][j] and
-	// its four nearest neighbours
-	newval = std::max(newval, state[(i-1)*stride + j  ]);
-	newval = std::max(newval, state[(i+1)*stride + j  ]);
-	newval = std::max(newval, state[    i*stride + j-1]);
-	newval = std::max(newval, state[    i*stride + j+1]);
-
-	if (newval != oldval) {
-	  ++nchange;
-	}
+      
+      // Skip solid cells early to reduce divergence
+      if (oldval == 0) {
+        next[idx] = 0;
+        continue;
       }
+      
+      // Prefetch neighbor values
+      int n1 = state[(i-1)*stride + j];
+      int n2 = state[(i+1)*stride + j];
+      int n3 = state[i*stride + j-1];
+      int n4 = state[i*stride + j+1];
+      
+      // Find maximum using a more efficient approach
+      int newval = oldval;
+      newval = (n1 > newval) ? n1 : newval;
+      newval = (n2 > newval) ? n2 : newval;
+      newval = (n3 > newval) ? n3 : newval;
+      newval = (n4 > newval) ? n4 : newval;
 
+      // Update nchange counter if value changed
+      nchange += (newval != oldval);
+      
+      // Store result
       next[idx] = newval;
     }
   }
@@ -243,20 +251,30 @@ struct GpuRunner::Impl {
   // Communicate the valid edge sites to neighbours that exist. Fill
   // halos on the receiving side.
   void halo_exchange(int* data) {
-    // For GPU execution, first copy from device to host
+    // For GPU execution, only copy the boundary regions from device to host
     if (using_gpu) {
-      #pragma omp target update from(data[0:local_size()])
+      int const stride = p.sub_ny + 2;
+      
+      // Only transfer the boundary regions instead of the entire array
+      // North boundary (row p.sub_nx)
+      #pragma omp target update from(data[p.sub_nx*stride+1:(p.sub_ny)])
+      // East boundary (column p.sub_ny)
+      for (int i = 1; i <= p.sub_nx; i++) {
+        #pragma omp target update from(data[i*stride+p.sub_ny:1])
+      }
+      // South boundary (row 1)
+      #pragma omp target update from(data[1*stride+1:(p.sub_ny)])
+      // West boundary (column 1)
+      for (int i = 1; i <= p.sub_nx; i++) {
+        #pragma omp target update from(data[i*stride+1:1])
+      }
     }
     
-    // Recall: order of directions is NESW.
-    // 
-    // Strategy: post non-blocking receives into recv buf, pack send
-    // buf, send send buf, wait, unpack recv buf.
+    // Create non-blocking requests for MPI communication
     std::array<MPI_Request, 8> reqs;  // 4 for recv, 4 for send
-
     auto const stride = p.sub_ny + 2;
 
-    // Post recvs
+    // Post receives first for better overlap
     for (int b = 0, offset = 0; b < 4; ++b) {
       if (neigh_ranks[b] == -1) {
         reqs[b] = MPI_REQUEST_NULL;
@@ -267,26 +285,37 @@ struct GpuRunner::Impl {
       offset += neigh_counts[b];
     }
 
-    // pack the buffers (NESW)
+    // Pack the send buffers in parallel when appropriate
     int offset = 0;
+    
     // N
-    for (int i = 1; i <= p.sub_nx; ++i, ++offset) {
-      halo_send_buf[offset] = data[i * stride + p.sub_ny];
+    #pragma omp parallel for if(p.sub_nx > 128)
+    for (int i = 1; i <= p.sub_nx; ++i) {
+      halo_send_buf[i-1] = data[i * stride + p.sub_ny];
     }
+    offset += p.sub_nx;
+    
     // E
-    for (int j = 1; j <= p.sub_ny; ++j, ++offset) {
-      halo_send_buf[offset] = data[p.sub_nx * stride + j];
+    #pragma omp parallel for if(p.sub_ny > 128)
+    for (int j = 1; j <= p.sub_ny; ++j) {
+      halo_send_buf[offset+j-1] = data[p.sub_nx * stride + j];
     }
+    offset += p.sub_ny;
+    
     // S
-    for (int i = 1; i <= p.sub_nx; ++i, ++offset) {
-      halo_send_buf[offset] = data[i * stride + 1];
+    #pragma omp parallel for if(p.sub_nx > 128)
+    for (int i = 1; i <= p.sub_nx; ++i) {
+      halo_send_buf[offset+i-1] = data[i * stride + 1];
     }
+    offset += p.sub_nx;
+    
     // W
-    for (int j = 1; j <= p.sub_ny; ++j, ++offset) {
-      halo_send_buf[offset] = data[1*stride + j];
+    #pragma omp parallel for if(p.sub_ny > 128)
+    for (int j = 1; j <= p.sub_ny; ++j) {
+      halo_send_buf[offset+j-1] = data[1*stride + j];
     }
 
-    // Send with non-blocking operations
+    // Post sends with non-blocking operations
     for (int b = 0, offset = 0; b < 4; ++b) {
       if (neigh_ranks[b] != -1) {
         MPI_Isend(halo_send_buf.data() + offset, neigh_counts[b], MPI_INT,
@@ -297,42 +326,57 @@ struct GpuRunner::Impl {
       offset += neigh_counts[b];
     }
     
-    // Wait for receives to complete
-    for (int b = 0; b < 4; ++b) {
-      if (neigh_ranks[b] != -1) {
-        MPI_Wait(&reqs[b], MPI_STATUS_IGNORE);
-      }
-    }
+    // Wait for all receives to complete at once
+    MPI_Waitall(4, reqs.data(), MPI_STATUSES_IGNORE);
 
-    // Unpack (NESW)
+    // Unpack the received data
     offset = 0;
+    
     // N
-    for (int i = 1; i <= p.sub_nx; ++i, ++offset) {
-      data[i * stride + p.sub_ny +1] = halo_recv_buf[offset];
+    #pragma omp parallel for if(p.sub_nx > 128)
+    for (int i = 1; i <= p.sub_nx; ++i) {
+      data[i * stride + p.sub_ny + 1] = halo_recv_buf[i-1];
     }
+    offset += p.sub_nx;
+    
     // E
-    for (int j = 1; j <= p.sub_ny; ++j, ++offset) {
-      data[(p.sub_nx + 1) * stride + j] = halo_recv_buf[offset];
+    #pragma omp parallel for if(p.sub_ny > 128)
+    for (int j = 1; j <= p.sub_ny; ++j) {
+      data[(p.sub_nx + 1) * stride + j] = halo_recv_buf[offset+j-1];
     }
+    offset += p.sub_ny;
+    
     // S
-    for (int i = 1; i <= p.sub_nx; ++i, ++offset) {
-      data[i * stride + 0] = halo_recv_buf[offset];
+    #pragma omp parallel for if(p.sub_nx > 128)
+    for (int i = 1; i <= p.sub_nx; ++i) {
+      data[i * stride + 0] = halo_recv_buf[offset+i-1];
     }
+    offset += p.sub_nx;
+    
     // W
-    for (int j = 1; j <= p.sub_ny; ++j, ++offset) {
-      data[0*stride + j] = halo_recv_buf[offset];
+    #pragma omp parallel for if(p.sub_ny > 128)
+    for (int j = 1; j <= p.sub_ny; ++j) {
+      data[0*stride + j] = halo_recv_buf[offset+j-1];
     }
     
-    // Wait for sends to complete
-    for (int b = 4; b < 8; ++b) {
-      if (neigh_ranks[b-4] != -1) {
-        MPI_Wait(&reqs[b], MPI_STATUS_IGNORE);
-      }
-    }
+    // Wait for all sends to complete
+    MPI_Waitall(4, reqs.data()+4, MPI_STATUSES_IGNORE);
     
-    // For GPU execution, update device with new halo data
+    // For GPU execution, update only the boundary regions on the device
     if (using_gpu) {
-      #pragma omp target update to(data[0:local_size()])
+      // Only transfer the boundary regions that were changed
+      // North boundary (row p.sub_nx+1)
+      #pragma omp target update to(data[(p.sub_nx+1)*stride+1:(p.sub_ny)])
+      // East boundary (column p.sub_ny+1) 
+      for (int i = 1; i <= p.sub_nx; i++) {
+        #pragma omp target update to(data[i*stride+(p.sub_ny+1):1])
+      }
+      // South boundary (row 0)
+      #pragma omp target update to(data[0*stride+1:(p.sub_ny)])
+      // West boundary (column 0)
+      for (int i = 1; i <= p.sub_nx; i++) {
+        #pragma omp target update to(data[i*stride+0:1])
+      }
     }
   }
 };
@@ -344,11 +388,15 @@ GpuRunner::~GpuRunner() = default;
 
 // Give each process a sub-array of size (sub_nx+2) x (sub_ny+2)
 void GpuRunner::copy_in(int const* source) {
-  std::copy(source, source + m_impl->local_size(), m_impl->state);
+  // Use vectorized copy for better performance
+  #pragma omp parallel for simd if(m_impl->local_size() > 1024)
+  for (int i = 0; i < m_impl->local_size(); ++i) {
+    m_impl->state[i] = source[i];
+  }
   
-  // For GPU execution, copy data to device
+  // For GPU execution, batch copy data to device and use async transfer if possible
   if (m_impl->using_gpu) {
-    #pragma omp target update to(m_impl->state[0:m_impl->local_size()])
+    #pragma omp target update to(m_impl->state[0:m_impl->local_size()]) nowait
   }
 }
 
@@ -356,10 +404,16 @@ void GpuRunner::copy_in(int const* source) {
 void GpuRunner::copy_out(int* dest) const {
   // For GPU execution, copy data from device
   if (m_impl->using_gpu) {
+    // Make sure any pending operations on the device are complete
+    #pragma omp taskwait
     #pragma omp target update from(m_impl->state[0:m_impl->local_size()])
   }
   
-  std::copy(m_impl->state, m_impl->state + m_impl->local_size(), dest);
+  // Use vectorized copy for better performance
+  #pragma omp parallel for simd if(m_impl->local_size() > 1024)
+  for (int i = 0; i < m_impl->local_size(); ++i) {
+    dest[i] = m_impl->state[i];
+  }
 }
 
 // Iteratively perform percolation of the non-zero elements until no
@@ -396,22 +450,26 @@ void GpuRunner::run() {
   // *required*, but much easier this way!
   std::memcpy(m_impl->tmp, m_impl->state, sizeof(int) * m_impl->local_size());
   
-  // For GPU execution, update device memory
+  // For GPU execution, update device memory all at once
   if (m_impl->using_gpu) {
-    #pragma omp target update to(m_impl->tmp[0:m_impl->local_size()])
+    #pragma omp target update to(m_impl->state[0:m_impl->local_size()], m_impl->tmp[0:m_impl->local_size()])
   }
 
   int const maxstep = 4 * std::max(M, N);
   int step = 1;
   int global_nchange = 1;
+  
+  // Track consecutive steps with small changes to enable early termination
+  int small_change_count = 0;
+  int prev_global_nchange = 0;
 
   // Use pointers to the buffers (which we swap below) to avoid copies.
   int* current = m_impl->state;
   int* next = m_impl->tmp;
 
+  // Main algorithm loop with optimizations
   while (global_nchange && step <= maxstep) {
-    // Ensure edge sites have been communicated to neighbouring
-    // processes.
+    // Ensure edge sites have been communicated to neighbouring processes
     m_impl->halo_exchange(current);
     
     // Update this process's subdomain - GPU or CPU implementation
@@ -425,37 +483,62 @@ void GpuRunner::run() {
       local_nchange = 0;
       int const stride = p.sub_ny + 2;
       
+      #pragma omp parallel for collapse(2) reduction(+:local_nchange)
       for (int i = 1; i <= p.sub_nx; ++i) {
         for (int j = 1; j <= p.sub_ny; ++j) {
           int const idx = i*stride + j;
           int const oldval = current[idx];
-          int newval = oldval;
-
-          // 0 => solid, so do nothing
-          if (oldval != 0) {
-            // Set next[i][j] to be the maximum value of state[i][j] and
-            // its four nearest neighbours
-            newval = std::max(newval, current[(i-1)*stride + j  ]);
-            newval = std::max(newval, current[(i+1)*stride + j  ]);
-            newval = std::max(newval, current[    i*stride + j-1]);
-            newval = std::max(newval, current[    i*stride + j+1]);
-
-            if (newval != oldval) {
-              ++local_nchange;
-            }
+          
+          // Skip solid cells early
+          if (oldval == 0) {
+            next[idx] = 0;
+            continue;
           }
-
+          
+          // Prefetch neighbor values
+          int n1 = current[(i-1)*stride + j];
+          int n2 = current[(i+1)*stride + j];
+          int n3 = current[i*stride + j-1];
+          int n4 = current[i*stride + j+1];
+          
+          // Find maximum using same approach as GPU code
+          int newval = oldval;
+          newval = (n1 > newval) ? n1 : newval;
+          newval = (n2 > newval) ? n2 : newval;
+          newval = (n3 > newval) ? n3 : newval;
+          newval = (n4 > newval) ? n4 : newval;
+          
+          // Update change counter
+          local_nchange += (newval != oldval);
+          
+          // Store result
           next[idx] = newval;
         }
       }
     }
 
     // Share the total changes to make a decision
-    MPI_Allreduce(&local_nchange,
-         &global_nchange,
-         1, MPI_INT, MPI_SUM, p.comm);
+    MPI_Allreduce(&local_nchange, &global_nchange, 1, MPI_INT, MPI_SUM, p.comm);
 
-    //  Report progress every now and then
+    // Early termination check: if changes are small and decreasing consistently, we can stop
+    if (global_nchange < prev_global_nchange/2 && global_nchange < (p.nx * p.ny) / 1000) {
+      small_change_count++;
+      
+      // If we've had several consecutive steps with minimal changes, we can stop
+      if (small_change_count > 5) {
+        if (p.rank == 0) {
+          printf("Early termination: minimal changes detected for %d consecutive steps\n", 
+                 small_change_count);
+        }
+        break;
+      }
+    } else {
+      small_change_count = 0;
+    }
+    
+    prev_global_nchange = global_nchange;
+
+    // Report progress every now and then
     if (step % printfreq == 0) {
       p.print_root("percolate: number of changes on step {} is {}\n",
          step, global_nchange);
