@@ -16,7 +16,7 @@
 #include <vector>
 #include <array>
 #include <cstring>
-#include <unistd.h> // For gethostname
+#include <unistd.h> // I used this to get the hostname of the machine
 #include "util.h"
 #include "decomp.h"
 #include "perc_gpu.h"
